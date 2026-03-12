@@ -2,6 +2,8 @@
 
 FastAPI сервис для ответов на вопросы по `.docx` через OpenRouter.
 
+Сервис намеренно запускается одним процессом FastAPI. Фоновые задачи остаются внутри приложения, поэтому single-process режим здесь выбран осознанно.
+
 ## Запуск
 
 ```bash
@@ -11,9 +13,14 @@ docker compose up --build
 
 ## API
 
-- `POST /documents` -> `{"document_id":"<uuid>"}`
+- `POST /documents` -> `{"document_id":"<uuid>","status":"pending"}`
+- `GET /documents/{document_id}` -> статус индексации документа
 - `POST /questions` -> `{"question_id":"<uuid>"}`
 - `GET /questions/{question_id}` -> статус или ответ
+
+После перехода на OpenRouter embeddings старые документы нужно загрузить заново.
+
+После возврата на SQLite старая Postgres-база не используется. При первом старте будет создан новый `/app/data/app.db`.
 
 ## Демо
 
@@ -21,6 +28,7 @@ docker compose up --build
 
 ```bash
 curl -s -X POST "http://localhost:8000/documents" -F "file=@./data/ADC_8.docx"
+curl -s "http://localhost:8000/documents/<DOCUMENT_ID>"
 curl -s -X POST "http://localhost:8000/questions" -H "Content-Type: application/json" -d '{"document_id":"<DOCUMENT_ID>","question":"Укажи предмет договора"}'
 curl -s "http://localhost:8000/questions/<QUESTION_ID_1>"
 curl -s -X POST "http://localhost:8000/questions" -H "Content-Type: application/json" -d '{"document_id":"<DOCUMENT_ID>","question":"Какой номер и дата у этого договора?"}'

@@ -7,10 +7,13 @@ from fastapi.testclient import TestClient
 @pytest.fixture()
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     data_dir = tmp_path / "data"
+    database_path = data_dir / "test.db"
     monkeypatch.setenv("APP_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database_path}")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.setenv("OPENROUTER_MODEL", "qwen/qwen3-8b")
     monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("OPENROUTER_EMBEDDING_MODEL", "baai/bge-m3")
 
     from app.api import reset_service_caches
     from app.config import reset_settings_cache
