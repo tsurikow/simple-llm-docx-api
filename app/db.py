@@ -1,12 +1,12 @@
 from collections.abc import AsyncGenerator
 
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.models import Document, DocumentStatus, Question, QuestionStatus, utcnow
 
-_engine: AsyncEngine | None = None
+_engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
@@ -26,12 +26,6 @@ def reset_engine() -> None:
     global _engine, _session_factory
     _engine = None
     _session_factory = None
-
-
-def get_engine() -> AsyncEngine:
-    if _engine is None:
-        raise RuntimeError("Database engine is not initialized.")
-    return _engine
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:

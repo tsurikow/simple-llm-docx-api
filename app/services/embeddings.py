@@ -1,10 +1,17 @@
 import logging
+from typing import Protocol
 
 import numpy as np
 from openai import APIError, AsyncOpenAI
 
 
 logger = logging.getLogger(__name__)
+
+
+class EmbeddingsClient(Protocol):
+    async def embed_texts_async(self, texts: list[str]) -> np.ndarray: ...
+
+    async def embed_query_async(self, query: str) -> np.ndarray: ...
 
 
 class EmbeddingService:

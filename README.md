@@ -18,10 +18,6 @@ docker compose up --build
 - `POST /questions` -> `{"question_id":"<uuid>"}`
 - `GET /questions/{question_id}` -> статус или ответ
 
-После перехода на OpenRouter embeddings старые документы нужно загрузить заново.
-
-После возврата на SQLite старая Postgres-база не используется. При первом старте будет создан новый `/app/data/app.db`.
-
 ## Демо
 
 Подставьте `document_id` из первой команды в команды с вопросами, а затем `question_id` из каждой команды вопроса в следующую команду получения ответа.

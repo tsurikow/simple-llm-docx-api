@@ -28,7 +28,7 @@ def _make_service(tmp_path: Path, top_k: int) -> QAService:
         chunk_overlap=150,
         retrieval_top_k=top_k,
     )
-    return QAService(settings=settings, embeddings=_DummyEmbeddings())  # type: ignore[arg-type]
+    return QAService(settings=settings, embeddings=_DummyEmbeddings())
 
 
 def _retrieve(

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from time import perf_counter
 
+import numpy as np
 from langchain_community.document_loaders import Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -12,7 +13,7 @@ from app.config import Settings
 from app.db import get_session_factory
 from app.logging_utils import elapsed_since
 from app.models import Document, DocumentStatus, utcnow
-from app.services.embeddings import EmbeddingService
+from app.services.embeddings import EmbeddingsClient
 from app.storage import save_chunks, save_embeddings
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ class DocumentArtifacts:
 
 
 class DocumentService:
-    def __init__(self, settings: Settings, embeddings: EmbeddingService):
+    def __init__(self, settings: Settings, embeddings: EmbeddingsClient):
         self._embeddings = embeddings
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.chunk_size,
@@ -50,7 +51,7 @@ class DocumentService:
 
     @staticmethod
     def _save_artifacts(
-        document_dir: Path, chunks: list[str], vectors: object
+        document_dir: Path, chunks: list[str], vectors: np.ndarray
     ) -> DocumentArtifacts:
         chunks_path = document_dir / "chunks.json"
         embeddings_path = document_dir / "embeddings.npy"

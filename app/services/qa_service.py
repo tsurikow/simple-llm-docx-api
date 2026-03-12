@@ -12,7 +12,7 @@ from app.config import Settings
 from app.db import get_session_factory
 from app.logging_utils import elapsed_since
 from app.models import Document, Question, QuestionStatus, utcnow
-from app.services.embeddings import EmbeddingService
+from app.services.embeddings import EmbeddingsClient
 from app.services.prompts import build_messages
 from app.services.retrieval import is_contract_metadata_question, score_top_indices
 from app.storage import load_chunks, load_embeddings
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class QAService:
-    def __init__(self, settings: Settings, embeddings: EmbeddingService):
+    def __init__(self, settings: Settings, embeddings: EmbeddingsClient):
         self._settings = settings
         self._embeddings = embeddings
         self._llm: ChatOpenAI | None = None
