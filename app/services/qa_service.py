@@ -1,137 +1,110 @@
-import math
+import asyncio
+import logging
+import threading
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
-from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from rank_bm25 import BM25Okapi
-from razdel import tokenize
-from sqlmodel import Session
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.config import Settings
-from app.db import get_engine
+from app.db import get_session_factory
+from app.logging_utils import elapsed_since
 from app.models import Document, Question, QuestionStatus, utcnow
 from app.services.embeddings import EmbeddingService
+from app.services.prompts import build_messages
+from app.services.retrieval import is_contract_metadata_question, score_top_indices
 from app.storage import load_chunks, load_embeddings
+
+logger = logging.getLogger(__name__)
 
 
 class QAService:
-    _DENSE_WEIGHT = 0.7
-    _BM25_WEIGHT = 0.3
-
     def __init__(self, settings: Settings, embeddings: EmbeddingService):
         self._settings = settings
         self._embeddings = embeddings
         self._llm: ChatOpenAI | None = None
+        self._llm_lock = threading.Lock()
 
-    def process_question(self, question_id: str) -> None:
-        question, document = self._mark_processing_and_get_entities(question_id)
+    async def process_question(self, question_id: str) -> None:
+        started_at = perf_counter()
+        question, document = await self._mark_processing_and_get_entities(question_id)
         if question is None or document is None:
-            self._mark_failed(question_id, "Question or document was not found.")
+            await self._mark_failed(question_id, "Question or document was not found.")
             return
 
         try:
-            context = self.retrieve_context(document, question.question)
-            answer = self._generate_answer(question.question, context)
-            self._mark_completed(question_id, answer)
+            metadata_intent = is_contract_metadata_question(question.question)
+            context = await self.retrieve_context(document, question.question)
+            answer = await self._generate_answer(question.question, context, metadata_intent)
+            await self._set_question_state(
+                question_id,
+                status=QuestionStatus.COMPLETED,
+                answer=answer,
+                error=None,
+            )
+            logger.info(
+                "Question processed: question_id=%s document_id=%s elapsed=%.3fs",
+                question_id,
+                document.id,
+                elapsed_since(started_at),
+            )
         except Exception as exc:
-            self._mark_failed(question_id, str(exc))
+            logger.exception(
+                "Question processing failed: question_id=%s document_id=%s elapsed=%.3fs",
+                question_id,
+                document.id,
+                elapsed_since(started_at),
+            )
+            await self._mark_failed(question_id, str(exc))
 
-    def retrieve_context(self, document: Document, user_question: str) -> str:
-        chunks = load_chunks(Path(document.chunks_path))
-        vectors = load_embeddings(Path(document.embeddings_path))
-        if not chunks:
-            raise ValueError("No chunks available for this document.")
-        if vectors.ndim != 2:
-            raise ValueError("Invalid embeddings matrix shape.")
-        if vectors.shape[0] != len(chunks):
-            raise ValueError("Embeddings count does not match chunk count.")
+    async def retrieve_context(self, document: Document, user_question: str) -> str:
+        started_at = perf_counter()
+        chunks, vectors, load_elapsed = await self._load_document_index(document)
+        question_vector, embed_elapsed = await self._embed_question(user_question, vectors)
 
-        question_vector = self._embeddings.embed_query(user_question)
-        if question_vector.ndim != 1:
-            raise ValueError("Invalid question embedding shape.")
-        if vectors.shape[1] != question_vector.shape[0]:
-            raise ValueError("Embedding dimensions mismatch.")
-
-        dense_scores = vectors @ question_vector
-        bm25_scores = self._bm25_scores(chunks=chunks, query=user_question)
-        scores = self._hybrid_scores(dense_scores=dense_scores, bm25_scores=bm25_scores)
-        top_k = max(1, min(self._settings.retrieval_top_k, len(chunks)))
-        ranked_indices = np.argsort(scores)[::-1]
-        q = user_question.lower()
-        is_contract_meta = ("договор" in q) and (
-            ("номер" in q) or ("дата" in q) or ("№" in user_question)
+        scoring_started_at = perf_counter()
+        top_indices = await asyncio.to_thread(
+            score_top_indices,
+            chunks,
+            vectors,
+            question_vector,
+            user_question,
+            max(1, min(self._settings.retrieval_top_k, len(chunks))),
         )
+        scoring_elapsed = elapsed_since(scoring_started_at)
 
-        if is_contract_meta and chunks:
-            selected = [0]
-            for index in ranked_indices:
-                idx = int(index)
-                if idx == 0:
-                    continue
-                selected.append(idx)
-                if len(selected) >= top_k:
-                    break
-            top_indices = np.array(selected[:top_k], dtype=int)
-        else:
-            top_indices = ranked_indices[:top_k]
-
-        context_chunks = [chunks[index] for index in top_indices]
-        context = "\n\n".join(context_chunks).strip()
+        context = "\n\n".join(chunks[index] for index in top_indices).strip()
         if not context:
             raise ValueError("No relevant context was found.")
+
+        logger.info(
+            "Context retrieved: document_id=%s chunks=%s top_k=%s metadata=%s load=%.3fs embed=%.3fs rerank=%.3fs total=%.3fs",
+            document.id,
+            len(chunks),
+            len(top_indices),
+            is_contract_metadata_question(user_question),
+            load_elapsed,
+            embed_elapsed,
+            scoring_elapsed,
+            elapsed_since(started_at),
+        )
         return context
 
-    @classmethod
-    def _tokenize(cls, text: str) -> list[str]:
-        return [item.text.lower() for item in tokenize(text)]
-
-    @classmethod
-    def _bm25_scores(cls, chunks: list[str], query: str) -> np.ndarray:
-        query_tokens = cls._tokenize(query)
-        if not query_tokens:
-            return np.zeros(len(chunks), dtype=np.float32)
-        tokenized_chunks = [cls._tokenize(chunk) for chunk in chunks]
-        bm25 = BM25Okapi(tokenized_chunks)
-        scores = bm25.get_scores(query_tokens)
-        return np.asarray(scores, dtype=np.float32)
-
-    @classmethod
-    def _normalize_scores(cls, scores: np.ndarray) -> np.ndarray:
-        if scores.size == 0:
-            return scores
-        min_score = float(np.min(scores))
-        max_score = float(np.max(scores))
-        if math.isclose(min_score, max_score):
-            return np.zeros_like(scores, dtype=np.float32)
-        normalized = (scores - min_score) / (max_score - min_score)
-        return normalized.astype(np.float32)
-
-    @classmethod
-    def _hybrid_scores(
-        cls, dense_scores: np.ndarray, bm25_scores: np.ndarray
-    ) -> np.ndarray:
-        dense_norm = cls._normalize_scores(dense_scores)
-        bm25_norm = cls._normalize_scores(bm25_scores)
-        return cls._DENSE_WEIGHT * dense_norm + cls._BM25_WEIGHT * bm25_norm
-
-    def _generate_answer(self, user_question: str, context: str) -> str:
-        llm = self._get_llm()
-        system_prompt = (
-            "Ты помощник по вопросам к документу. Отвечай только на русском языке и "
-            "только на основе переданного контекста. Если в контексте нет данных для "
-            "точного ответа, прямо скажи, что информации недостаточно."
+    async def _generate_answer(
+        self, user_question: str, context: str, metadata_intent: bool
+    ) -> str:
+        started_at = perf_counter()
+        response = await self._get_llm().ainvoke(
+            build_messages(user_question, context, metadata_intent)
         )
-        human_prompt = (
-            f"Контекст документа:\n{context}\n\n"
-            f"Вопрос пользователя:\n{user_question}\n\n"
-            "Сформируй короткий и точный ответ."
-        )
-        response = llm.invoke(
-            [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=human_prompt),
-            ]
+        logger.info(
+            "LLM answered: model=%s metadata=%s context_chars=%s elapsed=%.3fs",
+            self._settings.openrouter_model,
+            metadata_intent,
+            len(context),
+            elapsed_since(started_at),
         )
         if isinstance(response.content, str):
             text = response.content.strip()
@@ -142,54 +115,106 @@ class QAService:
     def _get_llm(self) -> ChatOpenAI:
         if self._llm is not None:
             return self._llm
-        if not self._settings.openrouter_api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is not configured.")
-        self._llm = ChatOpenAI(
-            model=self._settings.openrouter_model,
-            api_key=self._settings.openrouter_api_key,
-            base_url=self._settings.openrouter_base_url,
-            temperature=0.0,
-        )
+        with self._llm_lock:
+            if self._llm is None:
+                if not self._settings.openrouter_api_key:
+                    raise RuntimeError("OPENROUTER_API_KEY is not configured.")
+                self._llm = ChatOpenAI(
+                    model=self._settings.openrouter_model,
+                    api_key=self._settings.openrouter_api_key,
+                    base_url=self._settings.openrouter_base_url,
+                    temperature=0.0,
+                    extra_body={"provider": {"sort": {"by": "latency"}}},
+                )
         return self._llm
 
-    def _mark_processing_and_get_entities(
+    async def _load_document_index(
+        self, document: Document
+    ) -> tuple[list[str], np.ndarray, float]:
+        started_at = perf_counter()
+        chunks, vectors = await asyncio.gather(
+            asyncio.to_thread(load_chunks, Path(document.chunks_path or "")),
+            asyncio.to_thread(load_embeddings, Path(document.embeddings_path or "")),
+        )
+        if not chunks:
+            raise ValueError("No chunks available for this document.")
+        if vectors.ndim != 2:
+            raise ValueError("Invalid embeddings matrix shape.")
+        if vectors.shape[0] != len(chunks):
+            raise ValueError("Embeddings count does not match chunk count.")
+        return chunks, vectors, elapsed_since(started_at)
+
+    async def _embed_question(
+        self, user_question: str, vectors: np.ndarray
+    ) -> tuple[np.ndarray, float]:
+        started_at = perf_counter()
+        question_vector = await self._embeddings.embed_query_async(user_question)
+        if question_vector.ndim != 1:
+            raise ValueError("Invalid question embedding shape.")
+        if vectors.shape[1] != question_vector.shape[0]:
+            raise ValueError("Embedding dimensions mismatch.")
+        return question_vector, elapsed_since(started_at)
+
+    async def _mark_processing_and_get_entities(
         self, question_id: str
     ) -> tuple[Question | None, Document | None]:
-        with Session(get_engine()) as session:
-            question = session.get(Question, question_id)
+        async with get_session_factory()() as session:
+            question = await session.get(Question, question_id)
             if question is None:
                 return None, None
-            document = session.get(Document, question.document_id)
-            question.status = QuestionStatus.PROCESSING
-            question.error = None
-            question.updated_at = utcnow()
-            session.add(question)
-            session.commit()
-            session.refresh(question)
-            if document is not None:
-                session.refresh(document)
+            document = await session.get(Document, question.document_id)
+            await self._apply_question_state(
+                session,
+                question,
+                status=QuestionStatus.PROCESSING,
+                answer=None,
+                error=None,
+                refresh=True,
+            )
             return question, document
 
-    def _mark_completed(self, question_id: str, answer: str) -> None:
-        with Session(get_engine()) as session:
-            question = session.get(Question, question_id)
-            if question is None:
-                return
-            question.status = QuestionStatus.COMPLETED
-            question.answer = answer
-            question.error = None
-            question.updated_at = utcnow()
-            session.add(question)
-            session.commit()
+    async def _mark_failed(self, question_id: str, message: str) -> None:
+        await self._set_question_state(
+            question_id,
+            status=QuestionStatus.FAILED,
+            answer=None,
+            error=message[:500],
+        )
 
-    def _mark_failed(self, question_id: str, message: str) -> None:
-        with Session(get_engine()) as session:
-            question = session.get(Question, question_id)
-            if question is None:
-                return
-            question.status = QuestionStatus.FAILED
-            question.answer = None
-            question.error = message[:500]
-            question.updated_at = utcnow()
-            session.add(question)
-            session.commit()
+    async def _set_question_state(
+        self,
+        question_id: str,
+        *,
+        status: QuestionStatus,
+        answer: str | None,
+        error: str | None,
+    ) -> None:
+        async with get_session_factory()() as session:
+            question = await session.get(Question, question_id)
+            if question is not None:
+                await self._apply_question_state(
+                    session,
+                    question,
+                    status=status,
+                    answer=answer,
+                    error=error,
+                )
+
+    @staticmethod
+    async def _apply_question_state(
+        session: AsyncSession,
+        question: Question,
+        *,
+        status: QuestionStatus,
+        answer: str | None,
+        error: str | None,
+        refresh: bool = False,
+    ) -> None:
+        question.status = status
+        question.answer = answer
+        question.error = error
+        question.updated_at = utcnow()
+        session.add(question)
+        await session.commit()
+        if refresh:
+            await session.refresh(question)

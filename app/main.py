@@ -1,21 +1,46 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.api import router
 from app.config import get_settings
-from app.db import init_db, mark_processing_questions_as_failed
+from app.db import (
+    init_db,
+    mark_documents_as_failed,
+    mark_questions_as_failed,
+)
+from app.models import DocumentStatus, QuestionStatus
 from app.storage import ensure_storage_dirs
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         ensure_storage_dirs(settings)
-        init_db(settings.database_url)
-        mark_processing_questions_as_failed("Service restarted before completion.")
+        await init_db(settings.database_url)
+        await mark_documents_as_failed(
+            status=DocumentStatus.PENDING,
+            reason="Service restarted before background task started.",
+        )
+        await mark_documents_as_failed(
+            status=DocumentStatus.PROCESSING,
+            reason="Service restarted before document indexing completed.",
+        )
+        await mark_questions_as_failed(
+            status=QuestionStatus.PENDING,
+            reason="Service restarted before background task started.",
+        )
+        await mark_questions_as_failed(
+            status=QuestionStatus.PROCESSING,
+            reason="Service restarted before completion.",
+        )
         yield
 
     app = FastAPI(
@@ -29,4 +54,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-

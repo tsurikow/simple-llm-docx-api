@@ -1,9 +1,16 @@
-from app.models import QuestionStatus
+from app.models import DocumentStatus, QuestionStatus
 from pydantic import BaseModel
 
 
 class UploadDocumentResponse(BaseModel):
     document_id: str
+    status: DocumentStatus
+
+
+class DocumentStatusResponse(BaseModel):
+    document_id: str
+    status: DocumentStatus
+    error: str | None = None
 
 
 class CreateQuestionRequest(BaseModel):
@@ -20,4 +27,3 @@ class QuestionStatusResponse(BaseModel):
     status: QuestionStatus
     answer: str | None = None
     error: str | None = None
-

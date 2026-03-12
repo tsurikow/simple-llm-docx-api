@@ -1,7 +1,15 @@
 from datetime import datetime, UTC
 from enum import Enum
 
+from sqlalchemy import Column, DateTime
 from sqlmodel import Field, SQLModel
+
+
+class DocumentStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    READY = "ready"
+    FAILED = "failed"
 
 
 class QuestionStatus(str, Enum):
@@ -21,9 +29,18 @@ class Document(SQLModel, table=True):
     id: str = Field(primary_key=True)
     filename: str
     stored_path: str
-    chunks_path: str
-    embeddings_path: str
-    created_at: datetime = Field(default_factory=utcnow, nullable=False)
+    status: DocumentStatus = Field(default=DocumentStatus.PENDING, index=True)
+    chunks_path: str | None = Field(default=None)
+    embeddings_path: str | None = Field(default=None)
+    error: str | None = Field(default=None)
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
 
 class Question(SQLModel, table=True):
@@ -35,5 +52,11 @@ class Question(SQLModel, table=True):
     status: QuestionStatus = Field(default=QuestionStatus.PENDING, index=True)
     answer: str | None = Field(default=None)
     error: str | None = Field(default=None)
-    created_at: datetime = Field(default_factory=utcnow, nullable=False)
-    updated_at: datetime = Field(default_factory=utcnow, nullable=False)
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )

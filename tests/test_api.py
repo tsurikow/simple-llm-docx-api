@@ -1,21 +1,21 @@
+import asyncio
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
-from sqlmodel import Session, select
+import pytest
 
-from app.db import get_engine, mark_processing_questions_as_failed
-from app.models import Document, Question, QuestionStatus, utcnow
+from app.db import get_session_factory, mark_documents_as_failed, mark_questions_as_failed
+from app.models import Document, DocumentStatus, Question, QuestionStatus, utcnow
 from app.services.document_service import DocumentArtifacts, DocumentService
 from app.services.qa_service import QAService
 from app.storage import save_chunks, save_embeddings
 
 
-def _mock_index_document(
+async def _mock_index_document(
     _: DocumentService, document_id: str, source_path: Path, document_dir: Path
 ) -> DocumentArtifacts:
-    _ = document_id
-    _ = source_path
+    _ = document_id, source_path
     chunks_path = document_dir / "chunks.json"
     embeddings_path = document_dir / "embeddings.npy"
     save_chunks(chunks_path, ["Это тестовый контекст по документу."])
@@ -23,7 +23,7 @@ def _mock_index_document(
     return DocumentArtifacts(chunks_path=chunks_path, embeddings_path=embeddings_path)
 
 
-def _upload_document(client) -> str:
+def _upload_document(client) -> dict:
     response = client.post(
         "/documents",
         files={
@@ -35,22 +35,67 @@ def _upload_document(client) -> str:
         },
     )
     assert response.status_code == 200
-    return response.json()["document_id"]
+    return response.json()
 
 
-def test_upload_docx_success(client, monkeypatch):
-    test_client, data_dir = client
-    monkeypatch.setattr(DocumentService, "index_document", _mock_index_document)
+def _ask_question(client, document_id: str, question: str) -> dict:
+    response = client.post(
+        "/questions",
+        json={"document_id": document_id, "question": question},
+    )
+    assert response.status_code == 200
+    return response.json()
 
-    document_id = _upload_document(test_client)
-    document_dir = data_dir / "documents" / document_id
-    assert (document_dir / "source.docx").exists()
-    assert (document_dir / "chunks.json").exists()
-    assert (document_dir / "embeddings.npy").exists()
 
-    with Session(get_engine()) as session:
-        stored = session.get(Document, document_id)
-        assert stored is not None
+async def _get_document(document_id: str) -> Document | None:
+    async with get_session_factory()() as session:
+        return await session.get(Document, document_id)
+
+
+async def _get_question(question_id: str) -> Question | None:
+    async with get_session_factory()() as session:
+        return await session.get(Question, question_id)
+
+
+async def _insert_question(status: QuestionStatus) -> str:
+    async with get_session_factory()() as session:
+        document = Document(
+            id=str(uuid4()),
+            filename="sample.docx",
+            stored_path="/tmp/source.docx",
+            status=DocumentStatus.READY,
+            chunks_path="/tmp/chunks.json",
+            embeddings_path="/tmp/embeddings.npy",
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        )
+        question = Question(
+            id=str(uuid4()),
+            document_id=document.id,
+            question="Вопрос",
+            status=status,
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        )
+        session.add(document)
+        session.add(question)
+        await session.commit()
+        return question.id
+
+
+async def _insert_document(status: DocumentStatus) -> str:
+    async with get_session_factory()() as session:
+        document = Document(
+            id=str(uuid4()),
+            filename="sample.docx",
+            stored_path="/tmp/source.docx",
+            status=status,
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        )
+        session.add(document)
+        await session.commit()
+        return document.id
 
 
 def test_upload_rejects_non_docx(client):
@@ -62,96 +107,100 @@ def test_upload_rejects_non_docx(client):
     assert response.status_code == 400
 
 
-def test_question_for_unknown_document_returns_404(client):
+def test_happy_path_upload_poll_ask_poll(client, monkeypatch):
+    test_client, data_dir = client
+    monkeypatch.setattr(DocumentService, "index_document", _mock_index_document)
+    monkeypatch.setattr(
+        QAService,
+        "retrieve_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result="контекст"),
+    )
+    monkeypatch.setattr(
+        QAService,
+        "_generate_answer",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result="Готовый ответ"),
+    )
+
+    payload = _upload_document(test_client)
+    document_id = payload["document_id"]
+
+    assert payload["status"] == DocumentStatus.PENDING
+    assert (data_dir / "documents" / document_id / "source.docx").exists()
+    assert test_client.get(f"/documents/{document_id}").json()["status"] == DocumentStatus.READY
+
+    question_id = _ask_question(test_client, document_id, "О чем документ?")["question_id"]
+    result = test_client.get(f"/questions/{question_id}").json()
+
+    assert result["status"] == QuestionStatus.COMPLETED
+    assert result["answer"] == "Готовый ответ"
+
+    stored = asyncio.run(_get_document(document_id))
+    assert stored is not None
+    assert stored.status == DocumentStatus.READY
+
+
+def test_question_requires_ready_document(client, monkeypatch):
     test_client, _ = client
+
+    async def _noop(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(DocumentService, "process_document", _noop)
+    payload = _upload_document(test_client)
+
     response = test_client.post(
         "/questions",
-        json={"document_id": str(uuid4()), "question": "Что в документе?"},
+        json={"document_id": payload["document_id"], "question": "Что в документе?"},
     )
-    assert response.status_code == 404
 
-
-def test_happy_path_upload_ask_poll(client, monkeypatch):
-    test_client, _ = client
-    monkeypatch.setattr(DocumentService, "index_document", _mock_index_document)
-    monkeypatch.setattr(QAService, "retrieve_context", lambda *_: "контекст")
-    monkeypatch.setattr(QAService, "_generate_answer", lambda *_: "Готовый ответ")
-
-    document_id = _upload_document(test_client)
-    ask_response = test_client.post(
-        "/questions",
-        json={"document_id": document_id, "question": "О чем документ?"},
-    )
-    assert ask_response.status_code == 200
-    question_id = ask_response.json()["question_id"]
-
-    status_response = test_client.get(f"/questions/{question_id}")
-    assert status_response.status_code == 200
-    payload = status_response.json()
-    assert payload["status"] == QuestionStatus.COMPLETED
-    assert payload["answer"] == "Готовый ответ"
+    assert response.status_code == 409
+    assert "still being indexed" in response.json()["detail"]
 
 
 def test_llm_error_sets_failed_status(client, monkeypatch):
     test_client, _ = client
     monkeypatch.setattr(DocumentService, "index_document", _mock_index_document)
-    monkeypatch.setattr(QAService, "retrieve_context", lambda *_: "контекст")
+    monkeypatch.setattr(
+        QAService,
+        "retrieve_context",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result="контекст"),
+    )
 
-    def _raise(_: QAService, __: str, ___: str) -> str:
+    async def _raise(*_args, **_kwargs) -> str:
         raise RuntimeError("OpenRouter error")
 
     monkeypatch.setattr(QAService, "_generate_answer", _raise)
 
-    document_id = _upload_document(test_client)
-    ask_response = test_client.post(
-        "/questions",
-        json={"document_id": document_id, "question": "Сформулируй вывод."},
-    )
-    assert ask_response.status_code == 200
-    question_id = ask_response.json()["question_id"]
+    document_id = _upload_document(test_client)["document_id"]
+    question_id = _ask_question(test_client, document_id, "Сформулируй вывод.")["question_id"]
+    payload = test_client.get(f"/questions/{question_id}").json()
 
-    status_response = test_client.get(f"/questions/{question_id}")
-    assert status_response.status_code == 200
-    payload = status_response.json()
     assert payload["status"] == QuestionStatus.FAILED
     assert "OpenRouter error" in (payload["error"] or "")
 
 
-def test_restart_marks_processing_as_failed(client):
-    _, _ = client
-    with Session(get_engine()) as session:
-        document = Document(
-            id=str(uuid4()),
-            filename="sample.docx",
-            stored_path="/tmp/source.docx",
-            chunks_path="/tmp/chunks.json",
-            embeddings_path="/tmp/embeddings.npy",
-            created_at=utcnow(),
-        )
-        session.add(document)
-        session.add(
-            Question(
-                id=str(uuid4()),
-                document_id=document.id,
-                question="Вопрос",
-                status=QuestionStatus.PROCESSING,
-                created_at=utcnow(),
-                updated_at=utcnow(),
-            )
-        )
-        session.commit()
-
-        processing_question = session.exec(
-            select(Question).where(Question.status == QuestionStatus.PROCESSING)
-        ).first()
-        assert processing_question is not None
-        question_id = processing_question.id
-
-    changed = mark_processing_questions_as_failed("Service restarted.")
-    assert changed == 1
-
-    with Session(get_engine()) as session:
-        stored = session.get(Question, question_id)
+@pytest.mark.parametrize(
+    ("kind", "status", "marker", "reason"),
+    [
+        ("question", QuestionStatus.PENDING, mark_questions_as_failed, "Service restarted before background task started."),
+        ("question", QuestionStatus.PROCESSING, mark_questions_as_failed, "Service restarted before completion."),
+        ("document", DocumentStatus.PENDING, mark_documents_as_failed, "Service restarted before background task started."),
+        ("document", DocumentStatus.PROCESSING, mark_documents_as_failed, "Service restarted before completion."),
+    ],
+)
+def test_restart_recovery_marks_in_flight_records_failed(client, kind, status, marker, reason):
+    if kind == "question":
+        record_id = asyncio.run(_insert_question(status))
+        changed = asyncio.run(marker(status, reason))
+        stored = asyncio.run(_get_question(record_id))
         assert stored is not None
         assert stored.status == QuestionStatus.FAILED
-        assert stored.error == "Service restarted."
+    else:
+        record_id = asyncio.run(_insert_document(status))
+        changed = asyncio.run(marker(status, reason))
+        stored = asyncio.run(_get_document(record_id))
+        assert stored is not None
+        assert stored.status == DocumentStatus.FAILED
+
+    assert changed == 1
+    assert stored.error == reason
